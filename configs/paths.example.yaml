@@ -1,0 +1,6 @@
+project_root: /absolute/path/to/gleason-thesis-repo
+data:
+  raw_audio_dir: /absolute/path/to/audio
+  raw_transcript_dir: /absolute/path/to/cha
+  aligned_csv_dir: /absolute/path/to/aligned_csv
+  output_dir: /absolute/path/to/artifacts

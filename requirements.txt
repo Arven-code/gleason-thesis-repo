@@ -1,0 +1,15 @@
+numpy
+pandas
+matplotlib
+scipy
+scikit-learn
+statsmodels
+librosa
+soundfile
+pydub
+openai-whisper
+praat-parselmouth
+resemblyzer
+torch
+transformers
+datasets
