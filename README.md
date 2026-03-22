@@ -1,7 +1,3 @@
-Yes — here is a clean README text you can paste directly.
-
-This draft reflects the way your thesis frames the project: predicting next child-turn accuracy from the immediately preceding caregiver turn, using text plus prosody in the Gleason corpus, with classifier evaluation, ablations, mixed-effects analysis of caregiver role, IDS analyses, and qualitative acoustic exemplars  
-
 # Gleason Thesis Project
 
 This repository contains the codebase for my MA thesis project on caregiver prosody, child language learning, and multimodal modelling in the Gleason corpus.
@@ -77,4 +73,3 @@ This repository is not just a storage space for scripts. It is meant to keep the
 
 This is a research codebase developed for the thesis project. Some scripts were written as exploratory tools during analysis and are therefore kept separately from the main reusable pipeline. The core folders in `src/` contain the scripts that matter most for reproducing the main stages of the project.
 
-If you want, I can now rewrite this into a slightly more academic version, or a simpler GitHub-style version that sounds more natural for recruiters and supervisors.
