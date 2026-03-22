@@ -1,0 +1,16 @@
+numpy
+pandas
+matplotlib
+scipy
+librosa
+soundfile
+openai-whisper
+resemblyzer
+scikit-learn
+statsmodels
+torch
+transformers
+datasets
+praat-parselmouth
+pydub
+sqlalchemy
