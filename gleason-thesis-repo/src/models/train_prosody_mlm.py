@@ -1,11 +1,7 @@
-# train_prosody_mlm.py
-# Train the BERT masked LM with the optional [PROS] token and the ablation runs.
-# Flags:
-#   --no-prosody      -> text-only baseline
-#   --shuffle-prosody -> keep [PROS] but shuffle prosody across the batch
-
-import os, json, argparse
+import json
+import argparse
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import torch
@@ -19,45 +15,59 @@ from transformers import (
     TrainingArguments,
 )
 
-DATA_DIRS = [
-    Path(r"/Users/arvendobay/Desktop/Documents/Documents 2025/UNINE/MA/Comms/MA thesis/CHILDES/Eng-NA/Gleason/Dinner/echo_datasets_v2"),
-    Path(r"/Users/arvendobay/Desktop/Documents/Documents 2025/UNINE/MA/Comms/MA thesis/CHILDES/Eng-NA/Gleason/Father/FINAL"),
-]
-GLOB_PATTERNS = [
-    "*_training_echo_STRICT.csv",
-    "*_training_echo_v2.csv",
-    "combined_training_echo_STRICT.csv",
-    "combined_training_echo_v2.csv",
-]
-
-MODEL_NAME = "bert-base-uncased"
 PROS_TOKEN = "[PROS]"
-MAX_LEN = 256
 MLM_PROB = 0.15
-
-PROSODY_COLS = [
-    "f0_mean", "f0_std", "f0_min", "f0_max",
-    "f0_median", "f0_iqr", "f0_slope",
-    "voicing_rate", "frames"
-]
-ADD_HAS_PROSODY_BIT = True
-PROS_HIDDEN = 128
-
-OUT_DIR = "out_mlm_pros"
-ARTIFACTS_DIR = "artifacts"
 SEED = 42
 
-def find_csvs():
+PROSODY_COLS = [
+    "f0_mean",
+    "f0_std",
+    "f0_min",
+    "f0_max",
+    "f0_median",
+    "f0_iqr",
+    "f0_slope",
+    "voicing_rate",
+    "frames",
+]
+
+ADD_HAS_PROSODY_BIT = True
+
+
+def find_csvs(data_dirs, patterns):
     files = []
-    for data_dir in DATA_DIRS:
-        for pat in GLOB_PATTERNS:
+    for data_dir in data_dirs:
+        data_dir = Path(data_dir)
+        if not data_dir.exists():
+            print(f"[WARN] Missing folder: {data_dir}")
+            continue
+        for pat in patterns:
             files.extend(sorted(data_dir.glob(pat)))
-    uniq, seen = [], set()
+
+    unique_files = []
+    seen = set()
     for p in files:
-        if p.name not in seen:
-            seen.add(p.name)
-            uniq.append(p)
-    return uniq
+        key = str(p.resolve())
+        if key not in seen:
+            seen.add(key)
+            unique_files.append(p)
+
+    return unique_files
+
+
+def detect_text_column(df: pd.DataFrame) -> str:
+    for col in ["text", "child_text", "transcript", "Transcript"]:
+        if col in df.columns:
+            return col
+    raise ValueError(f"No usable text column found. Columns: {df.columns.tolist()}")
+
+
+def detect_label_column(df: pd.DataFrame):
+    for col in ["child_label", "label_acc", "label"]:
+        if col in df.columns:
+            return col
+    return None
+
 
 def load_and_concat(csv_paths):
     dfs = []
@@ -68,45 +78,62 @@ def load_and_concat(csv_paths):
             df["__source_dir"] = str(p.parent)
             dfs.append(df)
         except Exception as e:
-            print(f"Could not read {p}: {e}")
+            print(f"[WARN] Could not read {p}: {e}")
+
     if not dfs:
-        raise FileNotFoundError(f"No training CSVs found under: {', '.join(map(str, DATA_DIRS))}")
+        raise FileNotFoundError("No readable CSV files found.")
+
     return pd.concat(dfs, ignore_index=True)
 
-def build_dataset(df: pd.DataFrame) -> Dataset:
-    if "text" in df.columns:
-        df["text"] = df["text"].astype(str)
-    elif "child_text" in df.columns:
-        df["text"] = df["child_text"].astype(str)
-    else:
-        raise ValueError("No 'text' or 'child_text' column found in CSVs.")
 
-    if "child_label" in df.columns:
-        df["label_acc"] = (df["child_label"] == 2.0).astype(int)
-    elif "label_acc" in df.columns:
-        df["label_acc"] = df["label_acc"].astype(int)
+def build_dataset(df: pd.DataFrame) -> Dataset:
+    text_col = detect_text_column(df)
+
+    df["text"] = df[text_col].map(lambda x: "" if pd.isna(x) else str(x))
+    df["text"] = df["text"].str.strip()
+    df = df[df["text"] != ""].copy()
+    df = df[df["text"].str.lower() != "nan"].copy()
+
+    label_col = detect_label_column(df)
+    if label_col == "child_label":
+        raw = pd.to_numeric(df["child_label"], errors="coerce")
+        df["label_acc"] = (raw == 2.0).astype(int)
+    elif label_col == "label_acc":
+        df["label_acc"] = pd.to_numeric(df["label_acc"], errors="coerce").fillna(0).astype(int)
+    elif label_col == "label":
+        raw = pd.to_numeric(df["label"], errors="coerce")
+        df["label_acc"] = (raw == 2.0).astype(int)
     else:
         df["label_acc"] = 0
 
     for c in PROSODY_COLS:
         if c not in df.columns:
             df[c] = np.nan
+
     has_pros = (~df["f0_mean"].isna()).astype(int)
     df[PROSODY_COLS] = df[PROSODY_COLS].fillna(0.0)
 
     pros_cols = PROSODY_COLS.copy()
     if ADD_HAS_PROSODY_BIT:
         df["has_prosody"] = has_pros
-        pros_cols += ["has_prosody"]
+        pros_cols.append("has_prosody")
 
-    df["pros_vec"] = df[pros_cols].apply(lambda r: np.array(r.values, dtype=np.float32), axis=1)
+    df["pros_vec"] = df[pros_cols].apply(
+        lambda r: np.array(r.values, dtype=np.float32),
+        axis=1,
+    )
 
     keep = ["text", "label_acc", "pros_vec", "__source_file", "__source_dir"]
-    if "child_row_idx" in df.columns:
-        keep.append("child_row_idx")
+
     if "child_id" in df.columns:
+        df["child_id"] = df["child_id"].map(lambda x: "" if pd.isna(x) else str(x))
         keep.append("child_id")
-    return Dataset.from_pandas(df[keep])
+
+    out = df[keep].copy()
+    out["pros_vec"] = out["pros_vec"].apply(lambda x: list(np.asarray(x, dtype=np.float32)))
+
+    return Dataset.from_pandas(out, preserve_index=False)
+
 
 class ProsodyProjector(nn.Module):
     def __init__(self, hidden_size: int, pros_dim: int, pros_hidden: int):
@@ -118,22 +145,34 @@ class ProsodyProjector(nn.Module):
             nn.Linear(pros_hidden, hidden_size),
         )
 
-    def forward(self, f):
-        return self.mlp(f)
+    def forward(self, x):
+        return self.mlp(x)
+
 
 class ProsodyCollator:
     def __init__(self, tokenizer, mlm_probability=0.15, shuffle_prosody=False):
-        self.base = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=mlm_probability)
+        self.base = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer,
+            mlm_probability=mlm_probability,
+        )
         self.shuffle = shuffle_prosody
 
     def __call__(self, examples):
-        base_examples = [{k: e[k] for k in ("input_ids", "attention_mask")} for e in examples]
+        base_examples = [
+            {k: e[k] for k in ("input_ids", "attention_mask")}
+            for e in examples
+        ]
         batch = self.base(base_examples)
 
         if any("label_acc" in e for e in examples):
-            batch["label_acc"] = torch.tensor([e.get("label_acc", 0) for e in examples], dtype=torch.long)
+            batch["label_acc"] = torch.tensor(
+                [e.get("label_acc", 0) for e in examples],
+                dtype=torch.long,
+            )
 
-        pros_lists, any_pros = [], False
+        pros_lists = []
+        any_pros = False
+
         for e in examples:
             if "pros_vec" in e and e["pros_vec"] is not None:
                 pros_lists.append(list(np.asarray(e["pros_vec"], dtype=np.float32)))
@@ -145,13 +184,16 @@ class ProsodyCollator:
             first = next((p for p in pros_lists if p is not None), None)
             dim = len(first) if first is not None else 1
             filled = [p if p is not None else [0.0] * dim for p in pros_lists]
+
             if self.shuffle and len(filled) > 1:
                 idx = np.arange(len(filled))
                 np.random.shuffle(idx)
                 filled = [filled[i] for i in idx]
+
             batch["pros_vec"] = torch.tensor(filled, dtype=torch.float32)
 
         return batch
+
 
 class ProsodyTrainer(Trainer):
     def __init__(self, *args, use_prosody=True, **kwargs):
@@ -160,8 +202,10 @@ class ProsodyTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         device = next(model.parameters()).device
+
         input_ids = inputs["input_ids"].to(device)
         attention_mask = inputs["attention_mask"].to(device)
+
         labels = inputs.get("labels")
         if labels is not None:
             labels = labels.to(device)
@@ -171,19 +215,30 @@ class ProsodyTrainer(Trainer):
             word_emb = model.get_input_embeddings()(input_ids)
             pros_emb = model.pros_projector(pros_vec)
             word_emb[:, 0, :] = pros_emb
-            outputs = model(inputs_embeds=word_emb, attention_mask=attention_mask, labels=labels)
+            outputs = model(
+                inputs_embeds=word_emb,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
         else:
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
 
         loss = outputs.loss
         return (loss, outputs) if return_outputs else loss
 
-def make_tok_map(use_prosody, tokenizer, pros_token_id, prosody_cols, add_has_prosody_bit, max_len):
+
+def make_tok_map(use_prosody, tokenizer, pros_token_id, max_len):
     def tok_map(batch):
-        enc = tokenizer(batch["text"], truncation=True, max_length=max_len)
+        texts = ["" if x is None else str(x) for x in batch["text"]]
+        enc = tokenizer(texts, truncation=True, max_length=max_len)
 
         if use_prosody:
-            new_ids, new_att = [], []
+            new_ids = []
+            new_att = []
             for ids, att in zip(enc["input_ids"], enc["attention_mask"]):
                 new_ids.append([pros_token_id] + ids)
                 new_att.append([1] + att)
@@ -192,50 +247,73 @@ def make_tok_map(use_prosody, tokenizer, pros_token_id, prosody_cols, add_has_pr
 
         enc["label_acc"] = list(batch.get("label_acc", [0] * len(enc["input_ids"])))
 
-        pros_dim = len(prosody_cols) + (1 if add_has_prosody_bit else 0)
+        pros_dim = len(PROSODY_COLS) + (1 if ADD_HAS_PROSODY_BIT else 0)
         if "pros_vec" in batch:
-            enc["pros_vec"] = [list(np.asarray(v, dtype=np.float32)) for v in batch["pros_vec"]]
+            enc["pros_vec"] = [
+                list(np.asarray(v, dtype=np.float32))
+                for v in batch["pros_vec"]
+            ]
         else:
             zero = [0.0] * pros_dim
             enc["pros_vec"] = [zero for _ in enc["input_ids"]]
 
         return enc
+
     return tok_map
+
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", action="append", required=True, help="Repeat for each input folder.")
+    parser.add_argument("--pattern", action="append", default=None, help="Repeat for each glob pattern.")
+    parser.add_argument("--model-name", default="bert-base-uncased")
+    parser.add_argument("--max-len", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--no-prosody", action="store_true", help="Disable prosody features (text-only baseline)")
-    parser.add_argument("--shuffle-prosody", action="store_true", help="Shuffle prosody vectors (negative control)")
+    parser.add_argument("--pros-hidden", type=int, default=128)
+    parser.add_argument("--out-dir", default="out_mlm_pros")
+    parser.add_argument("--artifacts-dir", default="artifacts")
+    parser.add_argument("--max-steps", type=int, default=-1, help="Use -1 for no cap.")
+    parser.add_argument("--no-prosody", action="store_true")
+    parser.add_argument("--shuffle-prosody", action="store_true")
     args = parser.parse_args()
 
+    patterns = args.pattern if args.pattern is not None else [
+        "*_training_echo_v2.csv",
+        "*_with_speaker_training_echo_v2.csv",
+        "*_reconstructed_from_audio.csv",
+    ]
+
     torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
-    csvs = find_csvs()
+    csvs = find_csvs(args.data_dir, patterns)
     if not csvs:
-        raise FileNotFoundError(f"No CSVs found under: {', '.join(map(str, DATA_DIRS))}")
+        raise FileNotFoundError("No CSV files found with the provided folders/patterns.")
 
-    print("Found CSVs:")
+    print("[INFO] Found CSVs:")
     per_dir = {}
     for p in csvs:
         print(" -", p)
         per_dir.setdefault(str(p.parent), 0)
         per_dir[str(p.parent)] += 1
-    print("Per-folder counts:")
+
+    print("[INFO] Per-folder counts:")
     for d, n in per_dir.items():
         print(f"   {d} -> {n} file(s)")
 
     df_all = load_and_concat(csvs)
     ds = build_dataset(df_all)
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+    model = AutoModelForMaskedLM.from_pretrained(args.model_name)
     use_prosody = not args.no_prosody
-    model = AutoModelForMaskedLM.from_pretrained(MODEL_NAME)
 
     if use_prosody:
-        num_added = tokenizer.add_special_tokens({"additional_special_tokens": [PROS_TOKEN]})
+        num_added = tokenizer.add_special_tokens(
+            {"additional_special_tokens": [PROS_TOKEN]}
+        )
         if num_added > 0:
             model.resize_token_embeddings(len(tokenizer))
         pros_token_id = tokenizer.convert_tokens_to_ids(PROS_TOKEN)
@@ -246,9 +324,7 @@ def main():
         use_prosody=use_prosody,
         tokenizer=tokenizer,
         pros_token_id=pros_token_id,
-        prosody_cols=PROSODY_COLS,
-        add_has_prosody_bit=ADD_HAS_PROSODY_BIT,
-        max_len=MAX_LEN,
+        max_len=args.max_len,
     )
 
     ds = ds.map(tok_map, batched=True, remove_columns=ds.column_names)
@@ -258,27 +334,36 @@ def main():
         model.pros_projector = ProsodyProjector(
             hidden_size=model.config.hidden_size,
             pros_dim=pros_dim,
-            pros_hidden=PROS_HIDDEN
+            pros_hidden=args.pros_hidden,
         )
 
-    collator = ProsodyCollator(tokenizer, mlm_probability=MLM_PROB, shuffle_prosody=args.shuffle_prosody)
+    collator = ProsodyCollator(
+        tokenizer=tokenizer,
+        mlm_probability=MLM_PROB,
+        shuffle_prosody=args.shuffle_prosody,
+    )
 
     run_tag = "textonly" if not use_prosody else ("shufflePROS" if args.shuffle_prosody else "prosody")
-    out_dir = f"{OUT_DIR}_{run_tag}"
+    out_dir = f"{args.out_dir}_{run_tag}"
 
-    training_args = TrainingArguments(
+    training_kwargs = dict(
         output_dir=out_dir,
         per_device_train_batch_size=args.batch,
         learning_rate=args.lr,
         num_train_epochs=args.epochs,
         weight_decay=0.01,
         warmup_ratio=0.1,
-        logging_steps=50,
+        logging_steps=10,
         save_strategy="epoch",
         report_to=["none"],
         seed=SEED,
         remove_unused_columns=False,
+        dataloader_pin_memory=False,
     )
+    if args.max_steps is not None and args.max_steps > 0:
+        training_kwargs["max_steps"] = args.max_steps
+
+    training_args = TrainingArguments(**training_kwargs)
 
     trainer = ProsodyTrainer(
         model=model,
@@ -290,30 +375,58 @@ def main():
 
     trainer.train()
 
-    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
-    export_cols = ["text", "label_acc"] + PROSODY_COLS + (["has_prosody"] if "has_prosody" in df_all.columns else [])
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    trainer.save_model(out_dir)
+    tokenizer.save_pretrained(out_dir)
+
+    artifacts_dir = Path(args.artifacts_dir)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    export_cols = ["text", "label_acc", "__source_file", "__source_dir"] + PROSODY_COLS
+    if "has_prosody" in df_all.columns:
+        export_cols.append("has_prosody")
+
     for c in export_cols:
         if c not in df_all.columns:
             df_all[c] = np.nan
 
-    df_all.to_csv(Path(ARTIFACTS_DIR) / f"train_rows_for_glmm_{run_tag}.csv", index=False)
+    df_all.to_csv(
+        artifacts_dir / f"train_rows_for_glmm_{run_tag}.csv",
+        index=False,
+    )
 
-    with open(Path(ARTIFACTS_DIR) / f"training_config_{run_tag}.json", "w") as f:
-        json.dump({
-            "data_dirs": [str(d) for d in DATA_DIRS],
-            "loaded_files": [p.name for p in csvs],
-            "model_name": MODEL_NAME,
-            "prosody_cols": PROSODY_COLS,
-            "add_has_prosody_bit": ADD_HAS_PROSODY_BIT,
-            "max_len": MAX_LEN,
-            "mlm_prob": MLM_PROB,
-            "batch_size": args.batch,
-            "lr": args.lr,
-            "epochs": args.epochs,
-            "use_prosody": use_prosody,
-            "shuffle_prosody": args.shuffle_prosody,
-        }, f, indent=2)
+    with open(artifacts_dir / f"training_config_{run_tag}.json", "w") as f:
+        json.dump(
+            {
+                "data_dirs": args.data_dir,
+                "patterns": patterns,
+                "loaded_files": [str(p) for p in csvs],
+                "model_name": args.model_name,
+                "prosody_cols": PROSODY_COLS,
+                "add_has_prosody_bit": ADD_HAS_PROSODY_BIT,
+                "max_len": args.max_len,
+                "mlm_prob": MLM_PROB,
+                "batch_size": args.batch,
+                "lr": args.lr,
+                "epochs": args.epochs,
+                "use_prosody": use_prosody,
+                "shuffle_prosody": args.shuffle_prosody,
+                "out_dir": out_dir,
+                "artifacts_dir": str(artifacts_dir),
+                "max_steps": args.max_steps,
+            },
+            f,
+            indent=2,
+        )
 
+    print("\n[OK] Training complete.")
+    print(f"- Saved model:  {out_dir}")
+    print(f"- GLMM input:   {artifacts_dir / f'train_rows_for_glmm_{run_tag}.csv'}")
+    print(f"- Config:       {artifacts_dir / f'training_config_{run_tag}.json'}")
+
+
+if __name__ == "__main__":
+    main()
     print("\nTraining complete.")
     print(f"- Checkpoints: {out_dir}")
     print(f"- GLMM input:  {ARTIFACTS_DIR}/train_rows_for_glmm_{run_tag}.csv")
